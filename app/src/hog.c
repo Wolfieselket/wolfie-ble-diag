@@ -451,7 +451,8 @@ static void wolfie_diag_log_cb(struct k_work *work) {
         struct bt_conn_info info;
         info_result = bt_conn_get_info(conn, &info);
         if (info_result == 0 && info.type == BT_CONN_TYPE_LE) {
-            interval_us = info.le.interval_us;
+	interval_us = BT_CONN_INTERVAL_TO_US(info.le.interval);
+
             latency = info.le.latency;
         }
         bt_conn_unref(conn);
