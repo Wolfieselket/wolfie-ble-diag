@@ -8,6 +8,10 @@
 #include <zephyr/init.h>
 
 #include <zephyr/logging/log.h>
+#include <zephyr/kernel.h>
+#include <zephyr/sys/atomic.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/bluetooth/conn.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -413,11 +417,70 @@ int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
 K_MSGQ_DEFINE(zmk_hog_mouse_msgq, sizeof(struct zmk_hid_mouse_report_body),
               CONFIG_ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE, 4);
 
+/* WOLFIE_HID_DIAG: experimental counters. These measure queue/scheduling and
+ * bt_gatt_notify_cb() submission only, NOT arrival at Windows or BLE radio TX.
+ * Periodic aggregated output reduces the debug overhead (2-second intervals).
+ */
+static atomic_t wd_enqueued, wd_popped, wd_notify_accepted, wd_notify_errors;
+static atomic_t wd_no_connection, wd_queue_errors, wd_last_notify_error;
+static atomic_t wd_queue_highwater, wd_enq_gap_us_max, wd_submit_gap_us_max;
+static atomic_t wd_put_wait_us_max, wd_notify_call_us_max;
+static atomic_t wd_prev_enq_cycles, wd_prev_submit_cycles;
+
+static void wolfie_diag_max(atomic_t *value, uint32_t observed) {
+    atomic_val_t old = atomic_get(value);
+    while ((atomic_val_t)observed > old && !atomic_cas(value, old, (atomic_val_t)observed)) {
+        old = atomic_get(value);
+    }
+}
+
+static void wolfie_diag_mark_gap(atomic_t *previous, atomic_t *max_us) {
+    uint32_t now = k_cycle_get_32();
+    uint32_t last = (uint32_t)atomic_set(previous, (atomic_val_t)now);
+    if (last != 0U) {
+        wolfie_diag_max(max_us, k_cyc_to_us_floor32(now - last));
+    }
+}
+
+static void wolfie_diag_log_cb(struct k_work *work) {
+    uint32_t interval_us = 0;
+    uint32_t latency = 0;
+    int info_result = -1;
+    struct bt_conn *conn = zmk_ble_active_profile_conn();
+    if (conn != NULL) {
+        struct bt_conn_info info;
+        info_result = bt_conn_get_info(conn, &info);
+        if (info_result == 0 && info.type == BT_CONN_TYPE_LE) {
+            interval_us = info.le.interval_us;
+            latency = info.le.latency;
+        }
+        bt_conn_unref(conn);
+    }
+
+    printk("WOLFIE_HID_DIAG enq=%d popped=%d accepted=%d notify_err=%d "
+           "no_conn=%d put_err=%d last_err=%d q_high=%d q_now=%u "
+           "enq_gap_max_us=%d submit_gap_max_us=%d put_wait_max_us=%d "
+           "notify_call_max_us=%d conn_interval_us=%u conn_latency=%u "
+           "conn_info_err=%d\n",
+           atomic_set(&wd_enqueued, 0), atomic_set(&wd_popped, 0),
+           atomic_set(&wd_notify_accepted, 0), atomic_set(&wd_notify_errors, 0),
+           atomic_set(&wd_no_connection, 0), atomic_set(&wd_queue_errors, 0),
+           atomic_get(&wd_last_notify_error), atomic_set(&wd_queue_highwater, 0),
+           (unsigned int)k_msgq_num_used_get(&zmk_hog_mouse_msgq),
+           atomic_set(&wd_enq_gap_us_max, 0), atomic_set(&wd_submit_gap_us_max, 0),
+           atomic_set(&wd_put_wait_us_max, 0), atomic_set(&wd_notify_call_us_max, 0),
+           (unsigned int)interval_us, (unsigned int)latency, info_result);
+    k_work_reschedule(k_work_delayable_from_work(work), K_SECONDS(2));
+}
+K_WORK_DELAYABLE_DEFINE(wolfie_diag_dwork, wolfie_diag_log_cb);
+
 void send_mouse_report_callback(struct k_work *work) {
     struct zmk_hid_mouse_report_body report;
     while (k_msgq_get(&zmk_hog_mouse_msgq, &report, K_NO_WAIT) == 0) {
+        atomic_inc(&wd_popped);
         struct bt_conn *conn = zmk_ble_active_profile_conn();
         if (conn == NULL) {
+            atomic_inc(&wd_no_connection);
             return;
         }
 
@@ -427,7 +490,17 @@ void send_mouse_report_callback(struct k_work *work) {
             .len = sizeof(report),
         };
 
+        wolfie_diag_mark_gap(&wd_prev_submit_cycles, &wd_submit_gap_us_max);
+        uint32_t start_cycles = k_cycle_get_32();
         int err = bt_gatt_notify_cb(conn, &notify_params);
+        wolfie_diag_max(&wd_notify_call_us_max,
+                        k_cyc_to_us_floor32(k_cycle_get_32() - start_cycles));
+        if (err) {
+            atomic_inc(&wd_notify_errors);
+            atomic_set(&wd_last_notify_error, err);
+        } else {
+            atomic_inc(&wd_notify_accepted);
+        }
         if (err == -EPERM) {
             bt_conn_set_security(conn, BT_SECURITY_L2);
         } else if (err) {
@@ -441,8 +514,12 @@ void send_mouse_report_callback(struct k_work *work) {
 K_WORK_DEFINE(hog_mouse_work, send_mouse_report_callback);
 
 int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
+    uint32_t start_cycles = k_cycle_get_32();
     int err = k_msgq_put(&zmk_hog_mouse_msgq, report, K_MSEC(100));
+    wolfie_diag_max(&wd_put_wait_us_max,
+                    k_cyc_to_us_floor32(k_cycle_get_32() - start_cycles));
     if (err) {
+        atomic_inc(&wd_queue_errors);
         switch (err) {
         case -EAGAIN: {
             LOG_WRN("Consumer message queue full, popping first message and queueing again");
@@ -456,6 +533,10 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
         }
     }
 
+    atomic_inc(&wd_enqueued);
+    wolfie_diag_mark_gap(&wd_prev_enq_cycles, &wd_enq_gap_us_max);
+    wolfie_diag_max(&wd_queue_highwater,
+                    (uint32_t)k_msgq_num_used_get(&zmk_hog_mouse_msgq));
     k_work_submit_to_queue(&hog_work_q, &hog_mouse_work);
 
     return 0;
@@ -466,7 +547,9 @@ static int zmk_hog_init(void) {
     static const struct k_work_queue_config queue_config = {.name = "HID Over GATT Send Work"};
     k_work_queue_start(&hog_work_q, hog_q_stack, K_THREAD_STACK_SIZEOF(hog_q_stack),
                        CONFIG_ZMK_BLE_THREAD_PRIORITY, &queue_config);
-
+#if IS_ENABLED(CONFIG_ZMK_POINTING)
+    k_work_schedule(&wolfie_diag_dwork, K_SECONDS(2));
+#endif
     return 0;
 }
 
