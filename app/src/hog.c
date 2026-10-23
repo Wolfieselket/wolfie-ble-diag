@@ -29,6 +29,91 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/hid_indicators.h>
 #endif // IS_ENABLED(CONFIG_ZMK_HID_INDICATORS)
 
+/*
+ * Wolfie BLE link diagnostics (right central only).
+ * Observes connection parameters; does NOT change them or touch HID reporting.
+ * A short snapshot every 30 s catches links when PuTTY opens after boot.
+ * Remove this block after diagnosis to avoid long-term diagnostic overhead.
+ */
+static const char *wolfie_link_label(uint8_t role) {
+    if (role == BT_CONN_ROLE_CENTRAL) {
+        return "LEFT_SPLIT";
+    }
+    if (role == BT_CONN_ROLE_PERIPHERAL) {
+        return "WINDOWS_HOST";
+    }
+    return "UNKNOWN";
+}
+
+static void wolfie_print_link(struct bt_conn *conn, const char *event) {
+    struct bt_conn_info info;
+    int err = bt_conn_get_info(conn, &info);
+    if (err != 0) {
+        printk("[WOLFIE_LINK] %s info_error=%d\n", event, err);
+        return;
+    }
+    if (info.type != BT_CONN_TYPE_LE || info.state != BT_CONN_STATE_CONNECTED) {
+        return;
+    }
+
+    /* Bluetooth LE intervals use 1.25 ms units; timeouts use 10 ms units. */
+    uint32_t interval_us = (uint32_t)info.le.interval * 1250U;
+    printk("[WOLFIE_LINK] %s %s interval=%u.%03u ms latency=%u timeout=%u ms\n",
+           event, wolfie_link_label(info.role),
+           (unsigned int)(interval_us / 1000U),
+           (unsigned int)(interval_us % 1000U),
+           (unsigned int)info.le.latency,
+           (unsigned int)info.le.timeout * 10U);
+}
+
+static void wolfie_link_connected(struct bt_conn *conn, uint8_t err) {
+    if (err != 0) {
+        printk("[WOLFIE_LINK] connect_error=%u\n", (unsigned int)err);
+        return;
+    }
+    wolfie_print_link(conn, "connected");
+}
+
+static void wolfie_link_param_updated(struct bt_conn *conn, uint16_t interval,
+                                      uint16_t latency, uint16_t timeout) {
+    struct bt_conn_info info;
+    int err = bt_conn_get_info(conn, &info);
+    const char *link = (err == 0) ? wolfie_link_label(info.role) : "UNKNOWN";
+    uint32_t interval_us = (uint32_t)interval * 1250U;
+
+    printk("[WOLFIE_LINK] updated %s interval=%u.%03u ms latency=%u timeout=%u ms\n",
+           link, (unsigned int)(interval_us / 1000U),
+           (unsigned int)(interval_us % 1000U),
+           (unsigned int)latency, (unsigned int)timeout * 10U);
+}
+
+static void wolfie_link_disconnected(struct bt_conn *conn, uint8_t reason) {
+    struct bt_conn_info info;
+    int err = bt_conn_get_info(conn, &info);
+    const char *link = (err == 0) ? wolfie_link_label(info.role) : "UNKNOWN";
+    printk("[WOLFIE_LINK] disconnected %s reason=0x%02x\n", link, reason);
+}
+
+BT_CONN_CB_DEFINE(wolfie_link_diagnostic_callbacks) = {
+    .connected = wolfie_link_connected,
+    .disconnected = wolfie_link_disconnected,
+    .le_param_updated = wolfie_link_param_updated,
+};
+
+static void wolfie_snapshot_link(struct bt_conn *conn, void *data) {
+    ARG_UNUSED(data);
+    wolfie_print_link(conn, "snapshot");
+}
+
+static void wolfie_link_snapshot_work_handler(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(wolfie_link_snapshot_work, wolfie_link_snapshot_work_handler);
+
+static void wolfie_link_snapshot_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+    bt_conn_foreach(BT_CONN_TYPE_LE, wolfie_snapshot_link, NULL);
+    k_work_reschedule(&wolfie_link_snapshot_work, K_SECONDS(30));
+}
+
 enum {
     HIDS_REMOTE_WAKE = BIT(0),
     HIDS_NORMALLY_CONNECTABLE = BIT(1),
@@ -584,6 +669,9 @@ static int zmk_hog_init(void) {
 #if IS_ENABLED(CONFIG_ZMK_POINTING)
     k_work_schedule(&wolfie_diag_dwork, K_SECONDS(2));
 #endif
+    /* Wolfie link snapshots: 10 s after startup, then every 30 s. */
+    k_work_schedule(&wolfie_link_snapshot_work, K_SECONDS(10));
+
     return 0;
 }
 
