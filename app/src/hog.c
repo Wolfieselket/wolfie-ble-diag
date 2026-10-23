@@ -426,6 +426,9 @@ static atomic_t wd_no_connection, wd_queue_errors, wd_last_notify_error;
 static atomic_t wd_queue_highwater, wd_enq_gap_us_max, wd_submit_gap_us_max;
 static atomic_t wd_put_wait_us_max, wd_notify_call_us_max;
 static atomic_t wd_prev_enq_cycles, wd_prev_submit_cycles;
+/* Stage 3: completion callback spacing, distinct from notification submission. */
+static atomic_t wd_completed, wd_prev_complete_cycles, wd_complete_gap_max_us;
+static atomic_t wd_complete_gt20ms, wd_complete_lt1ms;
 
 static void wolfie_diag_max(atomic_t *value, uint32_t observed) {
     atomic_val_t old = atomic_get(value);
@@ -461,7 +464,9 @@ static void wolfie_diag_log_cb(struct k_work *work) {
     printk("WOLFIE_HID_DIAG enq=%d popped=%d accepted=%d notify_err=%d "
            "no_conn=%d put_err=%d last_err=%d q_high=%d q_now=%u "
            "enq_gap_max_us=%d submit_gap_max_us=%d put_wait_max_us=%d "
-           "notify_call_max_us=%d conn_interval_us=%u conn_latency=%u "
+           "notify_call_max_us=%d complete=%d complete_gap_max_us=%d "
+           "complete_gt20ms=%d complete_lt1ms=%d "
+           "conn_interval_us=%u conn_latency=%u "
            "conn_info_err=%d\n",
            atomic_set(&wd_enqueued, 0), atomic_set(&wd_popped, 0),
            atomic_set(&wd_notify_accepted, 0), atomic_set(&wd_notify_errors, 0),
@@ -470,10 +475,37 @@ static void wolfie_diag_log_cb(struct k_work *work) {
            (unsigned int)k_msgq_num_used_get(&zmk_hog_mouse_msgq),
            atomic_set(&wd_enq_gap_us_max, 0), atomic_set(&wd_submit_gap_us_max, 0),
            atomic_set(&wd_put_wait_us_max, 0), atomic_set(&wd_notify_call_us_max, 0),
+           atomic_set(&wd_completed, 0), atomic_set(&wd_complete_gap_max_us, 0),
+           atomic_set(&wd_complete_gt20ms, 0), atomic_set(&wd_complete_lt1ms, 0),
            (unsigned int)interval_us, (unsigned int)latency, info_result);
     k_work_reschedule(k_work_delayable_from_work(work), K_SECONDS(2));
 }
 K_WORK_DELAYABLE_DEFINE(wolfie_diag_dwork, wolfie_diag_log_cb);
+
+/* Stage 3: called by Zephyr after a GATT notification has been sent.
+ * This is NOT acknowledgement of processing by Windows applications.
+ * We deliberately do not log every callback because USB logging adds jitter.
+ */
+static void wolfie_diag_notify_complete_cb(struct bt_conn *conn, void *user_data) {
+    ARG_UNUSED(conn);
+    ARG_UNUSED(user_data);
+    atomic_inc(&wd_completed);
+    uint32_t now = k_cycle_get_32();
+    uint32_t last = (uint32_t)atomic_set(&wd_prev_complete_cycles, (atomic_val_t)now);
+    if (last != 0U) {
+        uint32_t delta_us = k_cyc_to_us_floor32(now - last);
+        /* Ignore idle pauses between test holds and after reconnection. */
+        if (delta_us < 100000U) {
+            wolfie_diag_max(&wd_complete_gap_max_us, delta_us);
+            if (delta_us > 20000U) {
+                atomic_inc(&wd_complete_gt20ms);
+            }
+            if (delta_us < 1000U) {
+                atomic_inc(&wd_complete_lt1ms);
+            }
+        }
+    }
+}
 
 void send_mouse_report_callback(struct k_work *work) {
     struct zmk_hid_mouse_report_body report;
@@ -489,6 +521,7 @@ void send_mouse_report_callback(struct k_work *work) {
             .attr = &hog_svc.attrs[13],
             .data = &report,
             .len = sizeof(report),
+            .func = wolfie_diag_notify_complete_cb,
         };
 
         wolfie_diag_mark_gap(&wd_prev_submit_cycles, &wd_submit_gap_us_max);
